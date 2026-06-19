@@ -34,7 +34,7 @@ enum class TextTranslators(val label: String) {
             GEMINI -> GeminiTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             OPENROUTER -> OpenRouterTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             LIBRETRANSLATE -> LibreTranslateTranslator(fromLang, toLang, "http://10.0.0.10:5000/translate")
-            OLLAMA -> OllamaTranslator(fromLang, toLang, "http://10.0.0.10:11434/api/generate", "qwen3:4b") // استخدم أي نموذج محمل لديك
+            OLLAMA -> OllamaTranslator(fromLang, toLang, "http://10.0.0.10:11434/api/generate", "qwen3:4b")
         }
     }
 
