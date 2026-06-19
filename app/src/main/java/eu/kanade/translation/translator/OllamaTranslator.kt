@@ -9,6 +9,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit // تم إضافة استدعاء مكتبة الوقت هنا
 
 class OllamaTranslator(
     override val fromLang: TextRecognizerLanguage,
@@ -17,7 +18,12 @@ class OllamaTranslator(
     private val modelName: String
 ) : TextTranslator {
 
-    private val okHttpClient = OkHttpClient()
+    // تم تعديل المهلة الزمنية لتصبح 120 ثانية (دقيقتين) لتناسب الذكاء الاصطناعي
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
 
     override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
         try {
@@ -42,7 +48,6 @@ class OllamaTranslator(
 
                     val response = okHttpClient.newCall(build).await()
                     if (response.isSuccessful) {
-                        // تم إصلاح الخطأ هنا: استبدال continue بـ return@forEachIndexed
                         val rBody = response.body ?: return@forEachIndexed
                         val jsonResponse = JSONObject(rBody.string())
                         val translatedText = jsonResponse.optString("response", "").trim('"', '\n', ' ')
