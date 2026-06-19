@@ -19,19 +19,22 @@ enum class TextTranslators(val label: String) {
     GOOGLE("Google Translate"),
     GEMINI("Gemini AI [API KEY]"),
     OPENROUTER("OpenRouter [API KEY]"),
-    LIBRETRANSLATE("LibreTranslate [Local]");
+    LIBRETRANSLATE("LibreTranslate [Local]"),
+    OLLAMA("Ollama LLM [Local]");
 
-    fun build(pref : TranslationPreferences= Injekt.get(), fromLang: TextRecognizerLanguage = TextRecognizerLanguage.fromPref(pref.translateFromLanguage()), toLang: TextTranslatorLanguage = TextTranslatorLanguage.fromPref(pref.translateToLanguage())): TextTranslator{
+  fun build(pref : TranslationPreferences= Injekt.get(), fromLang: TextRecognizerLanguage = TextRecognizerLanguage.fromPref(pref.translateFromLanguage()), toLang: TextTranslatorLanguage = TextTranslatorLanguage.fromPref(pref.translateToLanguage())): TextTranslator{
         val maxOutputTokens=pref.translationEngineMaxOutputTokens().get().toIntOrNull()?:8914
         val temperature=pref.translationEngineTemperature().get().toFloatOrNull()?:1.0f
         val modelName=pref.translationEngineModel().get()
         val apiKey=pref.translationEngineApiKey().get()
+        
         return when(this){
             MLKIT -> MLKitTranslator(fromLang, toLang)
             GOOGLE ->GoogleTranslator(fromLang, toLang)
             GEMINI -> GeminiTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             OPENROUTER -> OpenRouterTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             LIBRETRANSLATE -> LibreTranslateTranslator(fromLang, toLang, "http://10.0.0.10:5000/translate")
+            OLLAMA -> OllamaTranslator(fromLang, toLang, "http://10.0.0.10:11434/api/generate", "qwen3:4b") // استخدم أي نموذج محمل لديك
         }
     }
 
