@@ -42,7 +42,8 @@ class OllamaTranslator(
 
                     val response = okHttpClient.newCall(build).await()
                     if (response.isSuccessful) {
-                        val rBody = response.body ?: continue
+                        // تم إصلاح الخطأ هنا: استبدال continue بـ return@forEachIndexed
+                        val rBody = response.body ?: return@forEachIndexed
                         val jsonResponse = JSONObject(rBody.string())
                         val translatedText = jsonResponse.optString("response", "").trim('"', '\n', ' ')
                         
