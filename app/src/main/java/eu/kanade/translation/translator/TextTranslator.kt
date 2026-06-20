@@ -20,7 +20,7 @@ enum class TextTranslators(val label: String) {
     GEMINI("Gemini AI [API KEY]"),
     OPENROUTER("OpenRouter [API KEY]"),
     LIBRETRANSLATE("LibreTranslate [Local]"),
-    OLLAMA("Ollama LLM [Local]");
+    LMSTUDIO("LM Studio [Local]"); // تم تحديث الخيار هنا ليتوافق مع LM Studio
 
   fun build(pref : TranslationPreferences= Injekt.get(), fromLang: TextRecognizerLanguage = TextRecognizerLanguage.fromPref(pref.translateFromLanguage()), toLang: TextTranslatorLanguage = TextTranslatorLanguage.fromPref(pref.translateToLanguage())): TextTranslator{
         val maxOutputTokens=pref.translationEngineMaxOutputTokens().get().toIntOrNull()?:8914
@@ -34,7 +34,7 @@ enum class TextTranslators(val label: String) {
             GEMINI -> GeminiTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             OPENROUTER -> OpenRouterTranslator(fromLang, toLang,apiKey,modelName,maxOutputTokens,temperature)
             LIBRETRANSLATE -> LibreTranslateTranslator(fromLang, toLang, "http://10.0.0.10:5000/translate")
-            OLLAMA -> OllamaTranslator(fromLang, toLang, "http://10.0.0.10:11434/api/generate", "qwen3:4b")
+            LMSTUDIO -> LMStudioTranslator(fromLang, toLang, "http://10.0.0.10:1234/v1/chat/completions") // نقطة الاتصال المحدثة والخاصة بـ LM Studio
         }
     }
 
