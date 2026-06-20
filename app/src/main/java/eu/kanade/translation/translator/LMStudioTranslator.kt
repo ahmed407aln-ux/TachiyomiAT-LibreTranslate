@@ -15,12 +15,12 @@ import java.util.concurrent.TimeUnit
 class LMStudioTranslator(
     override val fromLang: TextRecognizerLanguage,
     override val toLang: TextTranslatorLanguage,
-    private val apiUrl: String, // هنا نضع رابط LM Studio: http://10.0.0.10:1234/v1/chat/completions
+    private val apiUrl: String, // رابط الخادم: http://10.0.0.10:1234/v1/chat/completions
 ) : TextTranslator {
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS) // تمديد وقت القراءة ليتناسب مع حجم المودل 7B
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
@@ -30,29 +30,32 @@ class LMStudioTranslator(
 
             for ((_, page) in pages) {
                 page.blocks.forEachIndexed { _, block ->
-                    // توجيه صارم للنموذج لتقديم ترجمة صياغية غير حرفية
-                    val systemInstruction = "You are an expert manga translator. Translate the following text from ${fromLang.name} to ${toLang.label}. Provide only the natural, fluid translated text, without any explanations, thinking process, or additional formatting."
+                    // التأكد من إرسال نص نظيف تماماً وتجنب أي ترميز خاطئ
+                    val cleanBlockText = block.text.trim().replace("\n", " ")
+                    if (cleanBlockText.isBlank()) return@forEachIndexed
 
-                    // بناء هيكل الطلب المتوافق مع معمارية OpenAI / v1
+                    // تعليمات النظام الموجهة للنموذج لتقديم ترجمة صياغية احترافية
+                    val systemInstruction = "You are an expert manga translator. Translate the following text from ${fromLang.name} to ${toLang.label}. Provide ONLY the natural, fluid translated text, without any explanations, thinking process, or additional formatting."
+
+                    // بناء هيكل JSON الدقيق المتوافق مع OpenAI API
                     val root = JSONObject()
                     root.put("model", "qwen2.5-7b-instruct")
-                    
+
                     val messagesArray = JSONArray()
 
-                    // رسالة التوجيه (System)
                     val systemMsg = JSONObject()
                     systemMsg.put("role", "system")
                     systemMsg.put("content", systemInstruction)
                     messagesArray.put(systemMsg)
 
-                    // رسالة النص المراد ترجمته (User)
                     val userMsg = JSONObject()
                     userMsg.put("role", "user")
-                    userMsg.put("content", block.text)
+                    userMsg.put("content", cleanBlockText)
                     messagesArray.put(userMsg)
 
                     root.put("messages", messagesArray)
                     root.put("stream", false)
+                    root.put("temperature", 0.7) // نسبة توازن بين الدقة والإبداع الصياغي
 
                     val body = root.toString().toRequestBody(mediaType)
                     val build: Request = Request.Builder()
@@ -61,23 +64,24 @@ class LMStudioTranslator(
                         .post(body)
                         .build()
 
+                    // إرسال الطلب والانتظار حتى يستجيب كرت الشاشة
                     val response = okHttpClient.newCall(build).await()
+                    
                     if (response.isSuccessful) {
                         val rBody = response.body ?: return@forEachIndexed
                         val jsonResponse = JSONObject(rBody.string())
                         
-                        // استخراج النص المترجم من هيكل الاختيارات (choices)
                         val choices = jsonResponse.optJSONArray("choices")
                         if (choices != null && choices.length() > 0) {
                             val message = choices.getJSONObject(0).optJSONObject("message")
-                            val translatedText = message?.optString("content", "")?.trim('"', '\n', ' ')
+                            val translatedText = message?.optString("content", "")?.trim('"', '\n', ' ', '`')
                             
-                            if (!translatedText.isNullOrEmpty()) {
+                            if (!translatedText.isNullOrEmpty() && translatedText != cleanBlockText) {
                                 block.translation = translatedText
                             }
                         }
                     } else {
-                        logcat { "LM Studio Error: HTTP ${response.code}" }
+                        logcat { "LM Studio API Error: HTTP ${response.code} - ${response.message}" }
                     }
                 }
             }
