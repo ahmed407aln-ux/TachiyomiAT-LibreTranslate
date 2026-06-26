@@ -162,6 +162,17 @@ kotlin {
 }
 
 dependencies {
+    // دعم الكوروتين لمهام Google Play (ML Kit)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
+
+
+    //إضافة مكتبة ONNX Runtime (الاعتماديات)
+// مكتبة تشغيل نماذج الذكاء الاصطناعي محلياً
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
+
+    // مكتبة تشغيل نماذج Llama/Gemma محلياً على الأندرويد
+    implementation("org.codeshipping:llama-kotlin-android:0.1.6")
+    implementation("androidx.core:core-ktx:1.15.0")
     implementation(projects.i18n)
     implementation(projects.i18nAt)
     implementation(projects.core.archive)
@@ -310,5 +321,11 @@ androidComponents {
 buildscript {
     dependencies {
         classpath(kotlinx.gradle)
+    }
+}
+configurations.all {
+    resolutionStrategy {
+        force("androidx.core:core:1.15.0")
+        force("androidx.core:core-ktx:1.15.0")
     }
 }

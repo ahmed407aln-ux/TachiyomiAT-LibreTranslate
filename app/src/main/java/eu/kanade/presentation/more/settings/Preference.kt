@@ -177,4 +177,5 @@ sealed class Preference {
 
         val preferenceItems: ImmutableList<PreferenceItem<out Any>>,
     ) : Preference()
+
 }

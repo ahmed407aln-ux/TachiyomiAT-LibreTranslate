@@ -1,6 +1,7 @@
 package eu.kanade.translation
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.hippo.unifile.UniFile
@@ -22,6 +23,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +37,8 @@ import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.encodeToStream
@@ -64,7 +69,6 @@ class ChapterTranslator(
     val queueState = _queueState.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     private var translationJob: Job? = null
 
     val isRunning: Boolean
@@ -73,22 +77,8 @@ class ChapterTranslator(
     @Volatile
     var isPaused: Boolean = false
 
-    private var textRecognizer: TextRecognizer
-    private var textTranslator: TextTranslator
-
-    init {
-        val fromLang = TextRecognizerLanguage.fromPref(translationPreferences.translateFromLanguage())
-        val toLang = TextTranslatorLanguage.fromPref(translationPreferences.translateToLanguage())
-        textRecognizer = TextRecognizer(fromLang)
-        textTranslator = TextTranslators.fromPref(translationPreferences.translationEngine())
-            .build(translationPreferences, fromLang, toLang)
-    }
-
     fun start(): Boolean {
-        if (isRunning || queueState.value.isEmpty()) {
-            return false
-        }
-
+        if (isRunning || queueState.value.isEmpty()) return false
         val pending = queueState.value.filter { it.status != Translation.State.TRANSLATED }
         pending.forEach { if (it.status != Translation.State.QUEUE) it.status = Translation.State.QUEUE }
         isPaused = false
@@ -135,6 +125,7 @@ class ChapterTranslator(
                     activeTranslationsErroredFlow.first()
                 }
             }.distinctUntilChanged()
+
             supervisorScope {
                 val translationJobs = mutableMapOf<Translation, Job>()
 
@@ -191,138 +182,277 @@ class ChapterTranslator(
     }
 
     private suspend fun translateChapter(translation: Translation) {
-        try {
-            // Check if recognizer reinitialization is needed
-            if (translation.fromLang != textRecognizer.language) {
-                textRecognizer.close()
-                textRecognizer = TextRecognizer(translation.fromLang)
-            }
-            // Check if translator reinitialization is needed
-            if (translation.fromLang != textTranslator.fromLang || translation.toLang != textTranslator.toLang) {
-                withContext(Dispatchers.IO) {
-                    textTranslator.close()
-                }
-                textTranslator = TextTranslators.fromPref(translationPreferences.translationEngine())
-                    .build(translationPreferences, translation.fromLang, translation.toLang)
-            }
-            // Directory where translations for a manga is stored
-            val translationMangaDir = provider.getMangaDir(translation.manga.title, translation.source)
+        val ocrEnginePref = translationPreferences.textRecognizerType().get()
+        android.util.Log.e(
+            "OCR_PREF",
+            "ocrEnginePref=$ocrEnginePref"
+        )
 
-            // translations save file
+
+        val textRecognizer = eu.kanade.translation.recognizer.RecognizerFactory.createRecognizer(
+            context,
+            translation.fromLang,
+            ocrEnginePref
+        )
+        val textTranslator = TextTranslators.fromPref(translationPreferences.translationEngine())
+            .build(translationPreferences, translation.fromLang, translation.toLang)
+
+        val isRtlLanguage = translation.fromLang.toString().lowercase().let {
+            it.contains("ja") || it.contains("ko") || it.contains("zh") || it.contains("ar")
+        }
+
+        try {
+            val translationMangaDir = provider.getMangaDir(translation.manga.title, translation.source)
             val saveFile = provider.getTranslationFileName(translation.chapter.name, translation.chapter.scanlator)
 
-            // Directory where chapter images is stored
             val chapterPath = downloadProvider.findChapterDir(
                 translation.chapter.name,
                 translation.chapter.scanlator,
                 translation.manga.title,
                 translation.source,
-            )!!
+            ) ?: throw IllegalStateException("Chapter directory not found")
 
             val pages = mutableMapOf<String, PageTranslation>()
-            val tmpFile = translationMangaDir.createFile("tmp")!!
             val streams = getChapterPages(chapterPath)
-            /**
-             * saving the stream to tmp file cuz i can't get the
-             * BitmapFactory.decodeStream() to work with the stream from .cbz archive
-             */
+
+            // تحديد المتزامنات بناءً على عدد الأنوية المتاحة لتجنب اختناق المعالج
+            val availableProcessors = Runtime.getRuntime().availableProcessors()
+            // نستخدم أنوية المعالج مقسومة على 2 أو بحد أقصى 4، لتجنب تجميد الجهاز بالكامل
+            val maxConcurrency = (availableProcessors / 2).coerceIn(2, 4)
+            val ocrSemaphore = Semaphore(maxConcurrency)
+
             withContext(Dispatchers.IO) {
-                for ((fileName, streamFn) in streams) {
-                    coroutineContext.ensureActive()
-                    streamFn().use { tmpFile.openOutputStream().use { out -> it.copyTo(out) } }
-                    val image = InputImage.fromFilePath(context, tmpFile.uri)
-                    val result = textRecognizer.recognize(image)
-                    val blocks = result.textBlocks.filter { it.boundingBox != null && it.text.length > 1 }
-                    val pageTranslation = convertToPageTranslation(blocks, image.width, image.height)
-                    if (pageTranslation.blocks.isNotEmpty()) pages[fileName] = pageTranslation
+                val deferredPages = streams.map { (fileName, streamFn) ->
+                    async {
+                        ocrSemaphore.withPermit {
+                            coroutineContext.ensureActive()
+
+                            var bitmap: android.graphics.Bitmap? = null
+                            try {
+                                // التحسين 1: تحويل الـ Stream إلى Bitmap مباشرة في الذاكرة (Zero Disk I/O)
+                                // هذا يعالج تعليقك السابق "i can't get the BitmapFactory.decodeStream() to work with the stream from .cbz archive"
+                                // الـ cbz أحياناً يحتاج إلى قراءة الستريم بالكامل كـ ByteArray أولاً
+                                val byteArray = streamFn().use { it.readBytes() }
+                                bitmap = BitmapFactory.decodeByteArray(byteArray, 0, byteArray.size)
+
+                                if (bitmap == null) throw IllegalStateException("Failed to decode image: $fileName")
+
+                                val image = InputImage.fromBitmap(bitmap, 0)
+
+                                val pageTranslation = PageTranslation(imgWidth = image.width.toFloat(), imgHeight = image.height.toFloat())
+
+// التحقق من نوع المحرك المستخدم
+                                if (textRecognizer is eu.kanade.translation.recognizer.PaddleTextRecognizer) {
+                                    val paddleBlocks = withContext(Dispatchers.Default) {
+                                        textRecognizer.process(image)
+                                    }
+
+                                    // تحويل مربعات PaddleOCR إلى TranslationBlock
+                                    paddleBlocks.forEach { block ->
+                                        pageTranslation.blocks.add(
+                                            TranslationBlock(
+                                                text = block.text,
+                                                width = block.width,
+                                                height = block.height,
+                                                symWidth = 15f,
+                                                symHeight = 15f,
+                                                angle = 0f,
+                                                x = block.x,
+                                                y = block.y
+                                            )
+                                        )
+                                    }
+                                    // دمج البلوكات المتقاربة لـ PaddleOCR
+                                    pageTranslation.blocks = smartMergeBlocks(pageTranslation.blocks, isRtlLanguage)
+
+                                } else {
+                                    // معالجة MLKit
+                                    val latImage = image as com.google.mlkit.vision.common.InputImage
+                                    val mlKitTextRecognizer = (textRecognizer as? eu.kanade.translation.recognizer.MlKitTextRecognizer)
+                                    val mlKitResult = withContext(Dispatchers.Default) { mlKitTextRecognizer?.process(latImage) }
+
+                                    if (mlKitResult != null) {
+                                        val blocks = mlKitResult.textBlocks.filter { it.boundingBox != null && it.text.length > 1 }
+                                        val merged = convertToPageTranslation(blocks, image.width, image.height, isRtlLanguage)
+                                        pageTranslation.blocks.addAll(merged.blocks)
+                                    }
+                                }
+
+                                if (pageTranslation.blocks.isNotEmpty()) Pair(fileName, pageTranslation) else null
+
+                                if (pageTranslation.blocks.isNotEmpty()) Pair(fileName, pageTranslation) else null
+
+                            } catch (e: Throwable) {
+                                logcat(LogPriority.ERROR, e) { "Failed to extract text from $fileName" }
+                                null
+                            } finally {
+                                // التحسين 2: تحرير الذاكرة العشوائية فوراً لتجنب OOM
+                                bitmap?.recycle()
+                            }
+                        }
+                    }
+                }
+
+                deferredPages.awaitAll().filterNotNull().forEach { (fileName, pageTrans) ->
+                    pages[fileName] = pageTrans
                 }
             }
-            tmpFile.delete()
+
             withContext(Dispatchers.IO) {
-                // Translate the text in blocks , this mutates the original blocks
                 textTranslator.translate(pages)
             }
-            // Serialize the Map and save to translations json file
+
             Json.encodeToStream(pages, translationMangaDir.createFile(saveFile)!!.openOutputStream())
             translation.status = Translation.State.TRANSLATED
+
         } catch (error: Throwable) {
             translation.status = Translation.State.ERROR
             logcat(LogPriority.ERROR, error)
+        } finally {
+            textRecognizer.close()
+            withContext(Dispatchers.IO) {
+                textTranslator.close()
+            }
         }
     }
 
-    private fun convertToPageTranslation(blocks: List<Text.TextBlock>, width: Int, height: Int): PageTranslation {
+    private fun convertToPageTranslation(blocks: List<Text.TextBlock>, width: Int, height: Int, isRtlLanguage: Boolean): PageTranslation {
         val translation = PageTranslation(imgWidth = width.toFloat(), imgHeight = height.toFloat())
         for (block in blocks) {
-            val bounds = block.boundingBox!!
-            val symBounds = block.lines.first().elements.first().symbols.first().boundingBox!!
+            val bounds = block.boundingBox ?: continue
+            val firstLine = block.lines.firstOrNull()
+            val firstElement = firstLine?.elements?.firstOrNull()
+            val symBounds = firstElement?.symbols?.firstOrNull()?.boundingBox
+
             translation.blocks.add(
                 TranslationBlock(
                     text = block.text,
                     width = bounds.width().toFloat(),
                     height = bounds.height().toFloat(),
-                    symWidth = symBounds.width().toFloat(),
-                    symHeight = symBounds.height().toFloat(),
-                    angle = block.lines.first().angle,
+                    symWidth = symBounds?.width()?.toFloat() ?: 15f,
+                    symHeight = symBounds?.height()?.toFloat() ?: 15f,
+                    angle = firstLine?.angle ?: 0f,
                     x = bounds.left.toFloat(),
                     y = bounds.top.toFloat(),
                 ),
             )
         }
-        // Smart merge overlapping text blocks
-        translation.blocks = smartMergeBlocks(translation.blocks, 50, 30, 30)
 
+        translation.blocks = smartMergeBlocks(translation.blocks, isRtlLanguage)
         return translation
     }
 
-    private fun smartMergeBlocks(
-        blocks: List<TranslationBlock>,
-        widthThreshold: Int,
-        xThreshold: Int,
-        yThreshold: Int,
-    ): MutableList<TranslationBlock> {
+    private fun smartMergeBlocks(blocks: List<TranslationBlock>, isRtlLanguage: Boolean): MutableList<TranslationBlock> {
         if (blocks.isEmpty()) return mutableListOf()
 
-        val merged = mutableListOf<TranslationBlock>()
-        var current = blocks[0]
-        for (i in 1 until blocks.size) {
-            val next = blocks[i]
-            if (shouldMergeTextBlock(current, next, widthThreshold, xThreshold, yThreshold)) {
-                current = mergeTextBlock(current, next)
+        val clusters = mutableListOf<MutableList<TranslationBlock>>()
+        val unmerged = blocks.toMutableList()
+
+        while (unmerged.isNotEmpty()) {
+            val currentCluster = mutableListOf(unmerged.removeAt(0))
+            var hasMerged: Boolean
+
+            do {
+                hasMerged = false
+                val iterator = unmerged.iterator()
+                while (iterator.hasNext()) {
+                    val next = iterator.next()
+                    if (currentCluster.any { shouldMergeTextBlock(it, next) }) {
+                        currentCluster.add(next)
+                        iterator.remove()
+                        hasMerged = true
+                    }
+                }
+            } while (hasMerged)
+
+            clusters.add(currentCluster)
+        }
+
+        return clusters.map { cluster ->
+            // الفرز الذكي بناءً على اللغة
+            val sortedCluster = if (isRtlLanguage) {
+                // للمانجا: من الأعلى للأسفل، ومن اليمين لليسار
+                cluster.sortedWith(compareBy<TranslationBlock> { it.y }.thenByDescending { it.x })
             } else {
-                merged.add(current)
-                current = next
+                // للغات الغربية: من الأعلى للأسفل، ومن اليسار لليمين
+                cluster.sortedWith(compareBy<TranslationBlock> { it.y }.thenBy { it.x })
+            }
+
+            var mergedBlock = sortedCluster[0]
+            for (i in 1 until sortedCluster.size) {
+                // التحسين 3: تمرير حالة اللغة لدالة الدمج لضمان ترتيب الكلمات الصحيح في الـ string
+                mergedBlock = mergeTextBlockOrder(mergedBlock, sortedCluster[i], isRtlLanguage)
+            }
+            mergedBlock
+        }.toMutableList()
+    }
+
+    private fun shouldMergeTextBlock(a: TranslationBlock, b: TranslationBlock): Boolean {
+        val verticalMargin = kotlin.math.max(a.symHeight, b.symHeight) * 1.2f
+        val horizontalMargin = kotlin.math.max(a.symHeight, b.symHeight) * 1.5f
+
+        val isXOverlap = (b.x <= a.x + a.width + horizontalMargin) && (b.x + b.width >= a.x - horizontalMargin)
+        val isYOverlap = (b.y <= a.y + a.height + verticalMargin) && (b.y + b.height >= a.y - verticalMargin)
+        val isAngleSimilar = abs(a.angle - b.angle) < 10f
+
+        return isXOverlap && isYOverlap && isAngleSimilar
+    }
+
+    private fun mergeTextBlockOrder(top: TranslationBlock, bottom: TranslationBlock, isRtlLanguage: Boolean): TranslationBlock {
+        val newX = kotlin.math.min(top.x, bottom.x)
+        val newY = kotlin.math.min(top.y, bottom.y)
+        val newWidth = kotlin.math.max(top.x + top.width, bottom.x + bottom.width) - newX
+        val newHeight = kotlin.math.max(top.y + top.height, bottom.y + bottom.height) - newY
+
+        val avgSymHeight = (top.symHeight + bottom.symHeight) / 2
+        val avgSymWidth = (top.symWidth + bottom.symWidth) / 2
+        val avgAngle = (top.angle + bottom.angle) / 2
+
+        // التحسين 3 (تابع): دمج النصوص بالترتيب الصحيح بناءً على اللغة
+        val combinedText = if (isRtlLanguage) {
+            // إذا كانا على نفس السطر تقريباً، والـ bottom على اليسار، نقرأ top أولاً ثم bottom
+            if (abs(top.y - bottom.y) < avgSymHeight) {
+                if (top.x > bottom.x) "${top.text} ${bottom.text}" else "${bottom.text} ${top.text}"
+            } else {
+                "${top.text} ${bottom.text}" // الأسطر الطبيعية (من أعلى لأسفل)
+            }
+        } else {
+            if (abs(top.y - bottom.y) < avgSymHeight) {
+                if (top.x < bottom.x) "${top.text} ${bottom.text}" else "${bottom.text} ${top.text}"
+            } else {
+                "${top.text} ${bottom.text}"
             }
         }
-        merged.add(current)
-        return merged
-    }
 
-    private fun shouldMergeTextBlock(
-        a: TranslationBlock,
-        b: TranslationBlock,
-        widthThreshold: Int,
-        xThreshold: Int,
-        yThreshold: Int,
-    ): Boolean {
-        val isWidthSimilar = (b.width < a.width) || (abs(a.width - b.width) < widthThreshold)
-        val isXClose = abs(a.x - b.x) < xThreshold
-        val isYClose = (b.y - (a.y + a.height)) < yThreshold
-        return isWidthSimilar && isXClose && isYClose
-    }
+        // نفس المنطق لدمج الترجمة إن وجدت مسبقاً (رغم أنها عادة تكون فارغة هنا)
+        val combinedTranslation = if (top.translation.isNotEmpty() && bottom.translation.isNotEmpty()) {
+            if (isRtlLanguage) {
+                if (abs(top.y - bottom.y) < avgSymHeight) {
+                    if (top.x > bottom.x) "${top.translation} ${bottom.translation}" else "${bottom.translation} ${top.translation}"
+                } else {
+                    "${top.translation} ${bottom.translation}"
+                }
+            } else {
+                if (abs(top.y - bottom.y) < avgSymHeight) {
+                    if (top.x < bottom.x) "${top.translation} ${bottom.translation}" else "${bottom.translation} ${top.translation}"
+                } else {
+                    "${top.translation} ${bottom.translation}"
+                }
+            }
+        } else {
+            top.translation + bottom.translation // أحدهما أو كلاهما فارغ
+        }
 
-    private fun mergeTextBlock(a: TranslationBlock, b: TranslationBlock): TranslationBlock {
-        val newX = kotlin.math.min(a.x, b.x)
-        val newY = a.y
-        val newWidth = kotlin.math.max(a.x + a.width, b.x + b.width) - newX
-        val newHeight = kotlin.math.max(a.y + a.height, b.y + b.height) - newY
         return TranslationBlock(
-            a.text + " " + b.text,
-            a.translation + " " + b.translation,
-            newWidth,
-            newHeight,
-            newX, newY, a.symHeight,
-            a.symWidth, a.angle,
+            text = combinedText,
+            translation = combinedTranslation,
+            width = newWidth,
+            height = newHeight,
+            x = newX,
+            y = newY,
+            symHeight = avgSymHeight,
+            symWidth = avgSymWidth,
+            angle = avgAngle,
         )
     }
 
@@ -362,7 +492,7 @@ class ChapterTranslator(
         }
     }
 
-    private inline fun removeFromQueueIf(predicate: (Translation) -> Boolean) {
+    private inline fun removeFromQueueIf(crossinline predicate: (Translation) -> Boolean) {
         _queueState.update { queue ->
             val translations = queue.filter { predicate(it) }
             translations.forEach { translation ->
