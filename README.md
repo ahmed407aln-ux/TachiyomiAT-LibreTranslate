@@ -1,4 +1,4 @@
-# TachiyomiAT AI Local Translation
+# Manova-translator
 
 A modern fork of **TachiyomiAT** focused on high-quality **offline AI-powered manga translation**.
 
